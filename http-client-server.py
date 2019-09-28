@@ -2,73 +2,100 @@ import socket
 import threading
 import time
 
-"""
-    The purpose of this exercise is to focus on programming using sockets, 
-        i.e. you are not allowed to use higher level abstractions provided by the language.
-    Implement a simple web client-server using TCP. The client should be able to request a static web-page
-    from the web-server and present the returned code on the screen (it should also work with standard web-servers).
-    The server should be able to accept requests (HTTP GET) and return a static web-page.
-    Remember that the server must be able to handle concurrent requests
-    (again the server should also work if the request comes from a standard web-server).
-"""
-
-# Define host and port - the address to bind to - from machine hostname
-# and any port >1024 to avoid privilege escalation
+# Define host and port from machine hostname and any port >1024 to avoid privilege escalation
 HOST, PORT = socket.gethostbyname(socket.gethostname()), 8080
 # Allow for 10 incoming connections in backlog
 SERVER_BACKLOG = 10
-# Declare a global lock for allowing prints to finish when threading.
+# Declare a global lock for allowing prints to finish when threading
 PRINT_LOCK = threading.Lock()
 
 
-def get_server_addr() -> (str, int):
-    """
-    Return the server-address constants for external use by clients
-    :return: Tuple [str: address, int: port]
-    """
-    return HOST, PORT
-
-
 def thread_print(arg):
-    # Ensure only one thread holds the printing lock to avoid mangling output
+    """
+    Thread-safe print function. Ensures only one thread holds the printing lock to avoid mangling output
+    :param arg: the value to print
+    :return: None
+    """
     with PRINT_LOCK:
         print(arg)
 
 
-def handle_client(sock: socket, addr):
-    data = sock.recv(512).decode("UTF-8")
-
-    thread_print(f"[SERVER] Received from {addr[0]}:{addr[1]}: {data}")
-
-    # If request was not a HTTP/1.1 request, send notice, close socket and thread
-    if not validate_protocol(data):
-        thread_print("[SERVER] Got a non HTTP/1.1 request. Informing and closing socket")
-        sock.sendall(b"Server only accepts HTTP/1.1. Please try again")
-        sock.close()
-        return
-
-    # Process a GET request
-    if data.startswith("GET"):
-        location = data.split(" ")[1]
-        if location == "/":
-            location = "index.html"
-        thread_print(f"[SERVER] Got GET request, trying to open {location}")
-        # Try finding request
-        try:
-            with open(location, "r") as file:
-                # Send requested location, joining list, and encoding
-                sock.sendall("".join(file.readlines()).encode("UTF-8"))
-        except OSError:
-            print("shit")
-
-
-def validate_protocol(req):
+def handle_client(sock: socket.socket, addr):
     """
-    Returns whether request specified HTTP/1.1 protocol
-    :param req: the request to validate
-    :return: boolean on accept
+    Server-handling of clients. Adheres to HTTP/1.1 with persistent connections but does not handle pipelined requests.
+     Handles only GET requests and validates protocol.
+    FIXME: time.time() calls are many and expensive - does not take actual handling into account.
+     Busy-waiting on empty data is expensive. Implement pipelined requests by threading request-handling.
+    :param sock: the socket representing the client connection
+    :param addr: the address (IP:PORT) for printing
+    :return: None
     """
-    return req.split(" ")[2] == "HTTP/1.1"
+    # Allow for, at most, thirty seconds to elapse between requests.
+    timeout = 30
+    time_now = time.time()
+    # While within the timeout, continue handling requests, otherwise close socket and return
+    while time.time() < time_now + timeout:
+        # Receive, at max, 512 bytes of data over socket, from client and decode, expecting UTF-8 encoding
+        data = sock.recv(512).decode("UTF-8")
+
+        # Busy-wait if nothing was received
+        if data == "":
+            time.sleep(0.1)
+            continue
+
+        # Print client-request with address prepended
+        thread_print(f"[SERVER] Received from {addr[0]}:{addr[1]}: {data.strip()}")
+
+        # If request was not a HTTP/1.1 request, send notice, close socket, and thread
+        if not data.split()[2].strip() == "HTTP/1.1":
+            thread_print("[SERVER] Got a non HTTP/1.1 request. Informing and closing socket")
+            sock.sendall(
+                b"HTTP/1.1 505 HTTP Version not supported\r\n\r\nServer only accepts HTTP/1.1. Please try again.")
+            sock.close()
+            return
+
+        # Process a GET request
+        if data.startswith("GET"):
+            # Get specified location of request-line
+            location = data.split(" ")[1]
+
+            # Contemporary browsers want favicons. Return 404 on such a request, close socket, and continue
+            if location == "/favicon.ico":
+                thread_print(f"[SERVER] Got GET request for 'favicon.ico' from {addr[0]}:{addr[1]}. Returning 404")
+                sock.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
+                continue
+
+            # Map implicit requests to root as 'index.html'
+            if location == "/":
+                location = "www/index.html"
+            else:
+                # Convert location to local mapping of public files.
+                location = "www" + location
+
+            thread_print(f"[SERVER] Got GET request, trying to open {location}")
+
+            # Try finding requested location, replying with 200 and content, or 404, and error-message
+            try:
+                with open(location, "r") as file:
+                    # Send requested location, joining read file from list, and encoding before sending
+                    data = "HTTP/1.1 200 OK\r\n\r\n" + "".join(file.readlines())
+                    sock.sendall(data.encode("UTF-8"))
+                    thread_print(f"[SERVER] Sent: {data.strip()}")
+            except FileNotFoundError as e:
+                data = f"HTTP/1.1 404 Not Found\r\n\r\nCould not find {location}, server-stack: {e}"
+                sock.sendall(data.encode("UTF-8"))
+                thread_print(f"[SERVER] ERROR: could not find {location}. Sent: {data}")
+            # Set new current-time after request has finished
+            time_now = time.time()
+
+        else:
+            # Return a 500 for all other requests
+            thread_print(f"[SERVER] Got a non-GET request. Sending 500 error to client. Received: {data.strip()}")
+            sock.sendall("HTTP/1.1 500 Internal Server Error".encode("UTF-8"))
+
+    thread_print(f"[SERVER] Timeout reached for {addr[0]}:{addr[1]}. Closing socket and thread.")
+    sock.close()
+    return
 
 
 def start_server():
@@ -77,7 +104,7 @@ def start_server():
     and passes accepted connections' sockets to handle_client()
     :return: None
     """
-    thread_print(f"[SERVER] Address: {HOST}:{PORT}")
+    thread_print(f"[SERVER] Using address: {HOST}:{PORT}")
 
     # Create socket using IPv4 and TCP
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -96,38 +123,44 @@ def start_server():
 
     # Continuously wait for new, incoming connections
     while True:
-        # Omit the server-thread from counting active connections. Todo: figure out if main thread counts
-        thread_print(f"[SERVER] Currently handling: {threading.active_count() - 2} active connections")
+        # Count active 'Server-handle' threads.
+        count = 0
+        for th in threading.enumerate():
+            if th.name == "Server-handle":
+                count += 1
+
+        thread_print(f"[SERVER] Currently handling: {count} active connections")
         # socket.accept() returns a new socket, representing each new connection established
         (connection, address) = sock.accept()
-        threading.Thread(target=handle_client, args=(connection, address)).start()
+        threading.Thread(target=handle_client, name="Server-handle", args=(connection, address)).start()
 
 
 def start_client():
     # Create a socket using IPv4 and TCP
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    thread_print(f"[CLIENT] Attempting to connect to: {get_server_addr()}")
-    sock.connect(get_server_addr())
+    thread_print(f"[CLIENT] Attempting to connect to: {(HOST, PORT)}")
+    sock.connect((HOST, PORT))
 
     # Form a HTTP/1.1 GET request for '/'
-    request = b"GET / HTTP/1.1"
+    request = "GET / HTTP/1.1"
 
     thread_print(f"[CLIENT] Sending: {request}")
-    sock.sendall(request)
+    sock.sendall(request.encode("UTF-8"))
 
     # Get response from server
-    data = sock.recv(512).decode("UTF-8")
+    data = sock.recv(512).decode("UTF-8").strip()
     thread_print(f"[CLIENT] Received: {data}")
 
 
-def test():
-    # Start a single server, todo: spin multiple servers up, incrementing port when unable to bind (client discovery)?
-    threading.Thread(target=start_server).start()
-    time.sleep(1)
-    for i in range(5):
-        threading.Thread(target=start_client).start()
+def run():
+    # Start a single server
+    threading.Thread(target=start_server, name="Server-main").start()
+    # Wait slightly to beautify output
+    time.sleep(0.25)
+    # Spin up two clients as simultaneously as possible
+    for i in range(2):
+        threading.Thread(target=start_client, name="Client").start()
 
 
-# Run test on execution
-test()
+run()
